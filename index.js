@@ -4,6 +4,8 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 
 require('dotenv').config();
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY)
+
 const port = process.env.PORT || 5000;
 
 // middleware
@@ -33,25 +35,9 @@ async function run() {
     const itemCollection = client.db("imsDb").collection("items");
     const reviewCollection = client.db("imsDb").collection("reviews");
     const cartCollection = client.db("imsDb").collection("carts");
+    const paymentCollection = client.db("imsDb").collection("payments");
 
-    app.get('/items', async(req, res) =>{
-        const result = await itemCollection.find().toArray();
-        res.send(result);
-    })
-
-    app.get('/reviews', async(req, res) =>{
-        const result = await reviewCollection.find().toArray();
-        res.send(result);
-    })
-
-    // jwt related api
-    app.post('/jwt', async(req, res) =>{
-        const user = req.body;
-        const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, { expiresIn: '1h' });
-        res.send({ token })
-      })
-
-      // middlewares
+     // middlewares
     const verifyToken = (req, res, next) =>{
         console.log('inside verify token', req.headers.authorization);
         if(!req.headers.authorization) {
@@ -80,6 +66,66 @@ async function run() {
         }
         next();
       }
+
+    app.get('/items', async(req, res) =>{
+        const result = await itemCollection.find().toArray();
+        res.send(result);
+    })
+
+    app.get('/items/:id', async(req, res) => {
+        const id = req.params.id;
+        const query = { _id: id }
+        const result = await itemCollection.findOne(query);
+        res.send(result);
+      })
+
+    app.post('/items', verifyToken, verifyAdmin, async (req, res) => {
+        const item = req.body;
+        const result = await itemCollection.insertOne(item);
+        res.send(result);
+      })
+
+    app.delete('/items/:id', verifyToken, verifyAdmin, async (req, res) => {
+        const id = req.params.id;
+        const query = { _id: id }
+        const result = await itemCollection.deleteOne(query);
+        res.send(result);
+      })
+
+      
+    app.patch('/items/:id', async (req, res) => {
+        const item = req.body;
+        const id = req.params.id;
+        const filter = { _id: id }
+        const updatedDoc = {
+          $set: {
+            name: item.name,
+            category: item.category,
+            price: item.price,
+            descriptio: item.description,
+            image: item.image
+          }
+        }
+  
+        const result = await itemCollection.updateOne(filter, updatedDoc)
+        res.send(result);
+      })
+  
+
+    app.get('/reviews', async(req, res) =>{
+        const result = await reviewCollection.find().toArray();
+        res.send(result);
+    })
+
+    // jwt related api
+    app.post('/jwt', async(req, res) =>{
+        const user = req.body;
+        const token = jwt.sign(user, process.env.ACCESS_TOKEN_SECRET, { expiresIn: '1h' });
+        res.send({ token })
+      })
+
+     
+   
 
     // users related api
     app.get('/users', verifyToken, verifyAdmin, async(req, res) => {
@@ -112,7 +158,7 @@ async function run() {
         res.send(result);
       })
 
-      app.patch('/users/admin/:id',  async (req, res) => {
+      app.patch('/users/admin/:id', verifyToken, verifyAdmin,  async (req, res) => {
         const id = req.params.id;
         const filter = { _id: new ObjectId(id) };
         const updatedDoc = {
@@ -124,7 +170,7 @@ async function run() {
         res.send(result);
       })
 
-      app.delete('/users/:id', async (req, res) => {
+      app.delete('/users/:id', verifyToken, verifyAdmin, async (req, res) => {
         const id = req.params.id;
         const query = { _id: new ObjectId(id) }
         const result = await userCollection.deleteOne(query);
@@ -154,6 +200,114 @@ async function run() {
         const result = await cartCollection.deleteOne(query);
         res.send(result);
       })
+
+         // payment intent
+         app.post('/create-payment-intent', async (req, res) => {
+            const { price } = req.body;
+            const amount = parseInt(price * 100);
+            console.log(amount, 'amount inside the intent');
+    
+            const paymentIntent = await stripe.paymentIntents.create({
+              amount: amount,
+              currency: 'usd',
+              payment_method_types: ['card']
+            });
+            res.send({
+              clientSecret: paymentIntent.client_secret
+            })
+          })
+
+          app.get('/payments/:email', verifyToken, async(req, res) =>{
+            const query = { email: req.params.email }
+            if(req.params.email !== req.decoded.email){
+              return res.status(403).send({message: 'forbidden access'});
+            }
+            const result = await paymentCollection.find(query).toArray();
+            res.send(result);
+          })
+
+          app.post('/payments', async(req, res) =>{
+            const payment = req.body;
+            const paymentResult = await paymentCollection.insertOne(payment);
+            console.log('payment info', payment);
+            const query = {_id: {
+              $in: payment.cartIds.map(id => new ObjectId (id))
+            }};
+            const deleteResult = await cartCollection.deleteMany(query);
+            res.send({paymentResult, deleteResult});
+          })
+
+     // stats or analytics
+      app.get('/admin-stats', verifyToken, verifyAdmin, async(req, res) =>{
+        const users = await userCollection.estimatedDocumentCount();
+        const menuItems = await itemCollection.estimatedDocumentCount();
+        const orders = await paymentCollection.estimatedDocumentCount();
+
+        // const payments = await paymentCollection.find().toArray();
+        // const revenue = payments.reduce((total, payment) => total + payment.price, 0);
+
+        const result = await paymentCollection.aggregate([
+          {
+            $group: {
+              _id: null,
+              totalRevenue: {
+                $sum: '$price'
+              }
+            }
+          }
+        ]).toArray();
+
+        const revenue = result.length > 0 ? result[0].totalRevenue : 0;
+
+        res.send({
+          users,
+          menuItems,
+          orders,
+          revenue
+        })
+      })
+
+         // using aggregate pipeline
+         app.get('/order-stats', verifyToken, verifyAdmin, async(req, res) =>{
+            const result = await paymentCollection.aggregate([
+              {
+                $unwind: '$menuItemIds'
+              },
+              {
+                $lookup: {
+                  from: 'menu',
+                  localField: 'menuItemIds',
+                  foreignField: '_id',
+                  as: 'menuItems'
+                }
+              },
+              {
+                $unwind: '$menuItems'
+              },
+              {
+                $group: {
+                  _id: '$menuItems.category',
+                  quantity:{
+                    $sum: 1
+                  },
+                  revenue: { $sum: '$menuItems.price'}
+                }
+              },
+              {
+                $project: {
+                  _id: 0,
+                  category: '$_id',
+                  quantity: '$quantity',
+                  revenue: '$revenue'
+                }
+              }
+    
+            ]).toArray()
+            res.send(result);
+          })
+    
+
+    
 
 
     // Send a ping to confirm a successful connection
